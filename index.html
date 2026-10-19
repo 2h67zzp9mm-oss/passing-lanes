@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Passing Lanes">
+<meta name="theme-color" content="#b00020">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Passing Lanes</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="icon-192.png">
+<link rel="stylesheet" href="leaflet.css">
+<style>
+  html,body{margin:0;height:100%;background:#111;color:#fff;font-family:-apple-system,system-ui,sans-serif;-webkit-user-select:none;user-select:none}
+  #map{position:absolute;inset:0}
+  #start{position:fixed;inset:0;z-index:2000;background:#111;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center}
+  #start h1{font-size:28px;margin:0 0 8px}
+  #start p{color:#bbb;font-size:15px;max-width:420px;line-height:1.4}
+  #go{font-size:34px;font-weight:700;padding:34px 48px;border:0;border-radius:22px;background:#d32f2f;color:#fff;margin:24px 0;width:85%;max-width:420px}
+  #banner{position:fixed;left:8px;right:8px;top:calc(env(safe-area-inset-top) + 8px);z-index:1000;background:rgba(0,0,0,.82);border-radius:14px;padding:12px 14px;font-size:20px;font-weight:600;line-height:1.25}
+  #banner small{display:block;font-size:13px;font-weight:400;color:#bbb;margin-top:3px}
+  #banner.in{background:rgba(0,120,40,.92)}
+  #banner.soon{background:rgba(190,30,30,.92)}
+  #bar{position:fixed;left:0;right:0;bottom:0;z-index:1000;display:flex;gap:8px;padding:8px 8px calc(env(safe-area-inset-bottom) + 8px);background:rgba(0,0,0,.7)}
+  #bar button{flex:1;font-size:16px;font-weight:600;padding:16px 4px;border:0;border-radius:12px;background:#333;color:#fff}
+  #bar #mark{background:#1565c0;flex:1.6}
+  #bar button.off{background:#7a1f1f}
+  #status{position:fixed;right:8px;bottom:calc(env(safe-area-inset-bottom) + 76px);z-index:1000;font-size:12px;background:rgba(0,0,0,.65);padding:4px 8px;border-radius:8px;color:#ddd;max-width:70%}
+  #toast{position:fixed;left:50%;top:45%;transform:translate(-50%,-50%);z-index:3000;background:rgba(0,0,0,.9);padding:16px 22px;border-radius:14px;font-size:20px;display:none}
+  #panel{position:fixed;inset:0;z-index:2500;background:#111;display:none;flex-direction:column;padding:calc(env(safe-area-inset-top) + 12px) 12px calc(env(safe-area-inset-bottom) + 12px)}
+  #panel textarea{flex:1;width:100%;box-sizing:border-box;font-size:13px;background:#222;color:#eee;border:0;border-radius:10px;padding:10px;-webkit-user-select:text;user-select:text}
+  #panel .row{display:flex;gap:8px;margin-top:10px}
+  #panel button{flex:1;font-size:17px;padding:14px;border:0;border-radius:10px;background:#333;color:#fff}
+  .dot{width:18px;height:18px;border-radius:50%;background:#1e88e5;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.6)}
+</style>
+</head>
+<body>
+<div id="start">
+  <h1>Passing Lanes</h1>
+  <p>Voice alerts for passing lanes around Mountain Home, AR (ARDOT road inventory data, 18 lanes). Keep this screen open while driving.</p>
+  <button id="go">Start Drive</button>
+  <p id="startnote">Tap to enable location, voice and keep-awake. Not a substitute for road signs or striping.</p>
+</div>
+<div id="map"></div>
+<div id="banner">Waiting for GPS…<small></small></div>
+<div id="status"></div>
+<div id="toast"></div>
+<div id="bar">
+  <button id="mark">📍 Mark missing lane</button>
+  <button id="pins">Pins</button>
+  <button id="mute">🔊</button>
+  <button id="center">Center</button>
+</div>
+<div id="panel">
+  <div style="font-size:20px;font-weight:700;margin-bottom:8px">Marked spots (missing passing lanes)</div>
+  <textarea id="pintext" readonly></textarea>
+  <div class="row"><button id="share">Share / Copy</button><button id="clear">Clear all</button><button id="close">Close</button></div>
+</div>
+<script src="leaflet.js"></script>
+<script src="logic.js"></script>
+<script>
+(function(){
+'use strict';
+var MI = 1609.344, $ = function(id){return document.getElementById(id);};
+var map, me, acc, tracker, follow = true, muted = false, lastFix = null, wakeLock = null, watchId = null;
+window.__events = [];   // debug log (also used by headless test)
+
+function fmtMi(m){ var mi = m / MI; return mi >= 10 ? Math.round(mi) + ' mi' : mi >= 0.95 ? mi.toFixed(1) + ' mi' : Math.round(m * 3.28084 / 50) * 50 + ' ft'; }
+function toast(t){ var el = $('toast'); el.textContent = t; el.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(function(){ el.style.display = 'none'; }, 1800); }
+function status(t){ $('status').textContent = t; }
+
+function say(text){
+  window.__events.push({ t: Date.now(), text: text });
+  if (muted || !('speechSynthesis' in window)) return;
+  var u = new SpeechSynthesisUtterance(text); u.rate = 1.0; u.volume = 1.0; u.lang = 'en-US';
+  speechSynthesis.speak(u);
+}
+
+async function keepAwake(){
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', function(){ wakeLock = null; });
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+document.addEventListener('visibilitychange', function(){ if (document.visibilityState === 'visible' && tracker && !wakeLock) keepAwake(); });
+
+function loadPins(){ try { return JSON.parse(localStorage.getItem('pl_pins') || '[]'); } catch (e) { return []; } }
+function savePins(p){ localStorage.setItem('pl_pins', JSON.stringify(p)); }
+function pinText(){
+  var p = loadPins();
+  if (!p.length) return '(no pins yet)';
+  return 'Missing passing lanes — ' + p.length + ' pin(s)\n' + p.map(function(x, i){
+    return (i + 1) + '. ' + new Date(x.time).toLocaleString() + '  ' + x.lat.toFixed(6) + ', ' + x.lon.toFixed(6) +
+      (x.acc != null ? '  ±' + Math.round(x.acc) + 'm' : '') + (x.heading != null ? '  heading ' + Math.round(x.heading) + '°' : '') +
+      '\n   https://maps.apple.com/?ll=' + x.lat.toFixed(6) + ',' + x.lon.toFixed(6) + '&q=Missing%20passing%20lane';
+  }).join('\n');
+}
+var pinLayer;
+function drawPins(){ if (!map) return; pinLayer.clearLayers(); loadPins().forEach(function(x){ L.circleMarker([x.lat, x.lon], { radius: 8, color: '#fff', weight: 2, fillColor: '#1565c0', fillOpacity: 1 }).bindPopup('Marked ' + new Date(x.time).toLocaleString()).addTo(pinLayer); }); }
+
+function updateBanner(b){
+  var el = $('banner'), main, sub = '';
+  el.className = '';
+  if (b.inLane) { el.className = 'in'; main = 'In passing lane — ends in ' + fmtMi(b.inLane.remaining); sub = b.inLane.seg.route + ' (' + b.inLane.seg.county + ')'; }
+  else if (b.ahead) { if (b.ahead.dist < MI * 1.1) el.className = 'soon'; main = 'Next passing lane: ' + fmtMi(b.ahead.dist) + ' ahead'; sub = b.ahead.seg.route + ' (' + b.ahead.seg.county + '), along road'; }
+  else if (b.nearest) { main = 'No passing lane on this road within ~1.5 mi'; sub = 'Nearest known: ' + b.nearest.seg.route + ', ' + fmtMi(b.nearest.dist) + ' away (straight line)'; }
+  else main = 'Waiting for GPS…';
+  el.firstChild.nodeValue = main; el.querySelector('small').textContent = sub;
+}
+
+function onFix(pos){
+  var c = pos.coords, fix = { lat: c.latitude, lon: c.longitude, heading: c.heading, speed: c.speed, t: pos.timestamp, acc: c.accuracy };
+  lastFix = fix;
+  var r = tracker.update(fix);
+  r.events.forEach(function(e){ say(e.text); toast(e.text); });
+  updateBanner(r.banner);
+  var ll = [fix.lat, fix.lon];
+  me.setLatLng(ll); acc.setLatLng(ll).setRadius(c.accuracy || 0);
+  if (follow) map.setView(ll, Math.max(map.getZoom(), 13), { animate: false });
+  status('GPS ±' + Math.round(c.accuracy) + ' m' + (c.speed != null && !isNaN(c.speed) ? ' · ' + Math.round(c.speed * 2.23694) + ' mph' : '') +
+    (r.heading != null ? ' · hdg ' + Math.round(r.heading) + '°' : ' · hdg ?') + (wakeLock ? ' · awake' : ' · no wake lock'));
+}
+function onErr(e){ status('GPS error: ' + e.message + (e.code === 1 ? ' — allow Location for Safari (Settings › Privacy › Location Services › Safari Websites: While Using)' : '')); }
+
+async function start(){
+  $('go').disabled = true; $('go').textContent = 'Starting…';
+  // iOS: speech must first be triggered from a user tap
+  if ('speechSynthesis' in window) { var u = new SpeechSynthesisUtterance('Passing lane alerts on'); u.volume = 1; speechSynthesis.speak(u); }
+  var awake = await keepAwake();
+  var data = await (await fetch('lanes.json', { cache: 'no-cache' })).json();
+  tracker = new PassingLogic.Tracker(data);
+  $('start').style.display = 'none';
+  map = L.map('map', { zoomControl: false, attributionControl: true }).setView([36.335, -92.385], 11);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors · lanes: ARDOT' }).addTo(map);
+  L.geoJSON(data, { style: { color: '#e00000', weight: 7, opacity: .9 },
+    onEachFeature: function(f, l){ var p = f.properties; l.bindPopup('<b>' + p.route + '</b> ' + p.county + '<br>ARDOT milepost ' + p.milepost + '<br>' + (p.length_m / MI).toFixed(2) + ' mi' + (p.extraLanes.indexOf(4) >= 0 ? '<br>(coded "combination")' : '')); } }).addTo(map);
+  pinLayer = L.layerGroup().addTo(map); drawPins();
+  acc = L.circle([0, 0], { radius: 0, color: '#1e88e5', weight: 1, fillOpacity: .12 }).addTo(map);
+  me = L.marker([0, 0], { icon: L.divIcon({ className: '', html: '<div class="dot"></div>', iconSize: [24, 24], iconAnchor: [12, 12] }), interactive: false }).addTo(map);
+  map.on('dragstart', function(){ follow = false; $('center').classList.add('off'); });
+  if (!awake) toast('Screen wake lock unavailable — set Settings › Display › Auto-Lock to Never');
+  status(awake ? 'Waiting for GPS… · awake' : 'Waiting for GPS… · no wake lock (set Auto-Lock: Never)');
+  if (!('geolocation' in navigator)) { status('No geolocation in this browser'); return; }
+  watchId = navigator.geolocation.watchPosition(onFix, onErr, { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+}
+
+$('go').addEventListener('click', start);
+$('center').addEventListener('click', function(){ follow = true; this.classList.remove('off'); if (lastFix) map.setView([lastFix.lat, lastFix.lon], Math.max(map.getZoom(), 14)); });
+$('mute').addEventListener('click', function(){ muted = !muted; this.textContent = muted ? '🔇' : '🔊'; this.classList.toggle('off', muted); if (muted) speechSynthesis.cancel(); });
+$('mark').addEventListener('click', function(){
+  if (!lastFix) { toast('No GPS fix yet'); return; }
+  var p = loadPins(); p.push({ lat: lastFix.lat, lon: lastFix.lon, acc: lastFix.acc, heading: tracker.heading, time: new Date().toISOString() });
+  savePins(p); drawPins(); toast('Marked (' + p.length + ')'); if (!muted) say('Marked');
+});
+$('pins').addEventListener('click', function(){ $('pintext').value = pinText(); $('panel').style.display = 'flex'; });
+$('close').addEventListener('click', function(){ $('panel').style.display = 'none'; });
+$('clear').addEventListener('click', function(){ if (confirm('Delete all marked pins?')) { savePins([]); drawPins(); $('pintext').value = pinText(); } });
+$('share').addEventListener('click', async function(){
+  var t = pinText();
+  try { if (navigator.share) { await navigator.share({ title: 'Missing passing lanes', text: t }); return; } } catch (e) { if (e.name === 'AbortError') return; }
+  try { await navigator.clipboard.writeText(t); toast('Copied'); } catch (e) { var ta = $('pintext'); ta.removeAttribute('readonly'); ta.select(); document.execCommand('copy'); ta.setAttribute('readonly', ''); toast('Copied'); }
+});
+})();
+</script>
+</body>
+</html>
